@@ -106,9 +106,34 @@ class ORSet:
 
         Returns ``self``; ``other`` is never modified. Repeated or reordered
         merges converge to the same state.
+
+        Raises ``ValueError`` — leaving both states untouched — when the
+        same tag is bound to different elements on the two sides. Such a
+        conflict means two live replicas share a ``replica_id`` and minted
+        colliding tags; unioning them would make the tag's ownership
+        ambiguous and the merged state unrestorable.
         """
         if not isinstance(other, ORSet):
             raise TypeError("can only merge with another ORSet")
+        # A tag identifies one add of one element; before unioning, verify
+        # against the full add history of both sides that no tag changes
+        # ownership across the two states. The check is total, so its
+        # outcome never depends on dict iteration order.
+        ownership: dict[Tag, str] = {}
+        for element, tags in self._adds.items():
+            for tag in tags:
+                ownership[tag] = element
+        conflicts: set[Tag] = set()
+        for element, tags in other._adds.items():
+            for tag in tags:
+                owner = ownership.get(tag)
+                if owner is not None and owner != element:
+                    conflicts.add(tag)
+        if conflicts:
+            raise ValueError(
+                "the same tag is bound to different elements: "
+                + ", ".join(repr(tag) for tag in sorted(conflicts))
+            )
         for element, tags in other._adds.items():
             self._adds.setdefault(element, set()).update(tags)
         self._removes.update(other._removes)
