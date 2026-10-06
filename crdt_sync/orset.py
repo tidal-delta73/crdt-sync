@@ -106,9 +106,31 @@ class ORSet:
 
         Returns ``self``; ``other`` is never modified. Repeated or reordered
         merges converge to the same state.
+
+        Raises ``ValueError`` — leaving both states untouched — when the two
+        states bind the same tag to different elements, which only happens
+        when distinct replicas were created with the same ``replica_id``.
         """
         if not isinstance(other, ORSet):
             raise TypeError("can only merge with another ORSet")
+        # A tag minted by one (replica_id, counter) pair names exactly one
+        # element. If the two states bind the same tag to different elements
+        # (e.g. two replicas were created with the same replica_id and each
+        # minted the tag independently), merging would make the tag
+        # ambiguous and the result unrestorable, so reject it up front
+        # without touching either state. The full owner map of ``self`` is
+        # built before checking, so detection never depends on dict order.
+        tag_owner: dict[Tag, str] = {}
+        for element, tags in self._adds.items():
+            for tag in tags:
+                tag_owner[tag] = element
+        for element, tags in other._adds.items():
+            for tag in tags:
+                owner = tag_owner.get(tag)
+                if owner is not None and owner != element:
+                    raise ValueError(
+                        "the same tag is bound to different elements"
+                    )
         for element, tags in other._adds.items():
             self._adds.setdefault(element, set()).update(tags)
         self._removes.update(other._removes)
