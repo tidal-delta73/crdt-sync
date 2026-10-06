@@ -35,3 +35,35 @@ a.merge(b)          # in place, returns a; b is left unchanged
 
 Merges are idempotent, commutative, and associative: duplicates or reordered
 delivery converge to the same value.
+
+## ORSet
+
+An observed-remove set CRDT for a removable set of strings. Each instance is
+a replica identified by a non-empty `replica_id`. Every `add` mints a unique
+tag; `remove` tombstones only the additions currently visible on that
+replica, so a concurrent same-name add on a peer survives, while an observed
+add does not.
+
+```python
+from crdt_sync import ORSet
+
+a = ORSet("A")
+a.add("apple")
+a.add("banana")
+a.contains("apple")   # True
+a.elements()          # {"apple", "banana"} — an independent copy
+a.remove("apple")     # True — withdraws the observed add
+a.remove("apple")     # False — nothing visible, state unchanged
+a.add("apple")        # a fresh add is never swallowed by the old tombstone
+
+snapshot = a.snapshot()          # JSON-serializable dict
+restored = ORSet.from_snapshot(snapshot)
+
+b = ORSet("B")
+b.add("cherry")
+a.merge(b)          # in place, returns a; b is left unchanged
+```
+
+Merges are idempotent, commutative, and associative: stale, duplicated or
+reordered snapshots converge to the same elements and can never resurrect a
+removed addition.
