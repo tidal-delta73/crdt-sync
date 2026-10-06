@@ -102,3 +102,44 @@ clock. If the very same timestamp ever carries two structurally different
 values (which means two live replicas share a `replica_id`), `merge` raises
 `ValueError` and leaves both registers untouched.
 
+## RGA
+
+A replicated growable array CRDT for an editable, deletable sequence of
+strings. Each instance is a replica identified by a non-empty `replica_id`; a
+fresh instance is empty. Every `insert` mints a unique `(replica_id, counter)`
+identifier and links the new element after its predecessor in the visible
+sequence. Concurrent inserts after the same predecessor are ordered by the
+greater identifier first (counter, then the originating replica id's Unicode
+order), with each element's own successors immediately following its branch,
+so the same set of edits always yields one unique order. `delete` keeps the
+removed element as a tombstone, so it never affects an unobserved concurrent
+insert and a later insert at the same position is not swallowed by the old
+tombstone.
+
+```python
+from crdt_sync import RGA
+
+a = RGA("A")
+a.insert(0, "hello")     # insert by visible zero-based position
+a.insert(1, " ")         # appending at the current length is allowed
+a.insert(2, "world")
+a.values()               # ["hello", " ", "world"] — an independent list
+a.delete(1)              # " " — returns the deleted value
+a.values()               # ["hello", "world"]
+
+snapshot = a.snapshot()          # JSON-serializable dict
+restored = RGA.from_snapshot(snapshot)
+
+b = RGA("B")
+b.insert(0, "offline edit")
+a.merge(b)          # in place, returns a; b is left unchanged
+```
+
+Merges are idempotent, commutative, and associative: stale, duplicated,
+reordered or bidirectionally exchanged snapshots converge to the same
+`values()` and the same insert records, predecessor links and tombstones. If
+the same node identifier ever carries a different value or predecessor on two
+replicas (which means two live replicas share a `replica_id`), `merge` raises
+`ValueError` and leaves both sequences untouched.
+
+
