@@ -35,3 +35,36 @@ a.merge(b)          # in place, returns a; b is left unchanged
 
 Merges are idempotent, commutative, and associative: duplicates or reordered
 delivery converge to the same value.
+
+## ORSet
+
+An observed-remove set of strings. Each `add` mints a unique tag; `remove`
+only tombstones the tags the replica has observed at call time, so a
+concurrent add on another replica survives until it has been observed.
+
+```python
+from crdt_sync import ORSet
+
+a = ORSet("A")
+a.add("apple")
+a.contains("apple")   # True
+a.elements()          # {"apple"} — an independent copy
+a.remove("apple")     # True — removes the observed additions
+a.remove("apple")     # False — nothing visible, state unchanged
+
+# An element removed in the past can be added again; the new add is never
+# swallowed by the historical removal.
+a.add("apple")
+
+snapshot = a.snapshot()           # JSON-serializable dict
+restored = ORSet.from_snapshot(snapshot)
+
+b = ORSet("B")
+a.merge(b)            # in place, returns a; b is left unchanged
+```
+
+If replica A removes an element without observing B's concurrent add of the
+same element, that add remains visible once states are exchanged. If A first
+merges (observing B's add) and then removes, the element disappears
+everywhere. Merges union both add tags and tombstones, so stale, duplicated
+or reordered snapshots never resurrect a removed addition.
