@@ -102,3 +102,45 @@ clock. If the very same timestamp ever carries two structurally different
 values (which means two live replicas share a `replica_id`), `merge` raises
 `ValueError` and leaves both registers untouched.
 
+## RGA
+
+A replicated growable array CRDT for an editable, deletable sequence of
+strings. Each instance is a replica identified by a non-empty `replica_id`; a
+fresh instance is empty. Every `insert(index, value)` mints a unique node id
+from a local Lamport-style counter and the replica id; the node hangs off the
+visible element immediately to its left. Concurrent inserts sharing a
+predecessor order by id in descending order — greater sequence first, then
+the replica id's Unicode order — and each node's own branch follows
+immediately, so the same set of operations always produces one sequence.
+
+`delete(index)` is observed-remove: it tombstones only the element currently
+visible at that position and returns its string. The node keeps its identity
+as a tombstone, so redelivery never errors or resurrects it; an insert never
+observed by the remover is unaffected, and a later insert at the same slot is
+never swallowed by the old tombstone.
+
+```python
+from crdt_sync import RGA
+
+a = RGA("A")
+a.insert(0, "he")      # insert at a visible zero-based position
+a.insert(1, "llo")     # append at the current length
+a.values()             # ["he", "llo"] — an independent list
+print(a.delete(1))     # "llo" — returns the removed string
+a.values()             # ["he"]
+
+snapshot = a.snapshot()          # JSON-serializable dict
+restored = RGA.from_snapshot(snapshot)
+
+b = RGA("B")
+b.merge(a)             # in place on b, returns b; a is left unchanged
+```
+
+Merges are idempotent, commutative, and associative: stale, duplicated,
+reordered or off-line-batched snapshots converge to the same `values()`, and
+converged replicas share identical insertion records, predecessor links and
+tombstones. JSON round-tripping a snapshot and continuing to insert never
+reuses an old id. If the very same node id ever carries a different string or
+predecessor (which means two live replicas share a `replica_id`), `merge`
+raises `ValueError` and leaves both states untouched.
+
