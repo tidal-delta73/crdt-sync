@@ -256,3 +256,60 @@ reuses a node id or rolls the clock back. Exchanging session snapshots in
 any order, with duplicates, converges every replica to the same `values()`,
 shared RGA records and clock components.
 
+### Causal compaction
+
+A bare `RGA` keeps every tombstone forever; only the session can reclaim
+them, because only the session has the causal context to do so safely.
+Every successful session `delete` is stamped with the clock components the
+deleting replica had observed at that moment. `compact(stable_clock)` takes
+a `VectorClock` *stability frontier* the caller derives from the
+acknowledgements of every replica taking part in sync — the greatest clock
+all participants have confirmed they observed — and reclaims tombstone
+nodes whose delete event that frontier already covers.
+
+```python
+from crdt_sync import VectorClock
+
+a = RGASession("A")
+a.insert(0, "a"); a.insert(1, "b")
+a.delete(1)                       # b is a leaf tombstone
+stable = VectorClock.from_snapshot(a.snapshot()["clock"])
+a.compact(stable)                 # 1 — b's record is reclaimed
+a.values()                        # ["a"] — unchanged by compaction
+a.compact(stable)                 # 0 — repeating a frontier reclaims nothing
+```
+
+Reclamation walks from the leaf ends: a tombstone is removed only once its
+delete is stable *and* no retained node still hangs off it, so a whole run
+of stable deleted branches peels in one call but compaction never crosses a
+live node, a delete the frontier does not cover, or a still-referenced
+anchor. It never advances the session clock and never changes `values()`;
+it returns the number of node records actually reclaimed. A non-`VectorClock`
+argument raises `TypeError`, and a frontier that is concurrent with the
+session clock or ahead of it raises `ValueError` with the session
+completely unchanged.
+
+Reclaimed nodes do not simply vanish: a permanent *retirement summary* keeps
+each node's id, value, predecessor anchor and delete causal context. On
+merge the summaries join by component-wise maximum, so a snapshot taken
+before compaction, a duplicated packet or an out-of-order packet arriving
+afterwards cannot resurrect a reclaimed node — its stale insert record and
+tombstone are consumed history and are filtered away — while a concurrent
+insert that only arrives later still weaves against the retired anchor.
+Compacted and uncompacted replicas merge in either direction and converge on
+the same visible sequence, the same clock components and the same shared
+sequence records (each side naturally keeps its own `replica_id`), and can
+keep inserting and deleting afterwards without ever reusing a node id or
+rolling a clock component back. A node id that carries conflicting content
+still raises `ValueError`, with sequence, clock and compaction metadata left
+atomically unchanged.
+
+The nested sequence snapshot keeps its classic four fields; once causal
+deletes or compaction exist it additionally carries `deletes` (per
+tombstone delete clocks) and `retired` (the retirement summary). Both
+round-trip completely through JSON, and `from_snapshot` still accepts the
+historical three-field session snapshot with a plain four-field RGA
+snapshot; such legacy tombstones simply carry no delete clock and are never
+eligible for compaction — their deletion time is never inferred.
+
+
