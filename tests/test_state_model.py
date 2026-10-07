@@ -1299,12 +1299,19 @@ class CompactionScopeTests(unittest.TestCase):
                 ]
                 self.assertEqual(offenders, [])
 
-    def test_package_exports_only_the_four_crdts_and_version(self) -> None:
+    def test_package_exports_the_crdts_vector_clock_and_version(self) -> None:
         import crdt_sync
 
         self.assertEqual(
             set(crdt_sync.__all__),
-            {"GCounter", "ORSet", "LWWRegister", "RGA", "__version__"},
+            {
+                "GCounter",
+                "ORSet",
+                "LWWRegister",
+                "RGA",
+                "VectorClock",
+                "__version__",
+            },
         )
 
     def test_abstract_models_exercise_merge_independently(self) -> None:

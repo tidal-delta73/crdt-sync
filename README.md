@@ -144,3 +144,35 @@ reuses an old id. If the very same node id ever carries a different string or
 predecessor (which means two live replicas share a `replica_id`), `merge`
 raises `ValueError` and leaves both states untouched.
 
+## VectorClock
+
+A vector clock for causal ordering of offline operations and reconnect sync.
+Each instance is a replica identified by a non-empty `replica_id`; a fresh
+clock reports no components. `tick(amount=1)` advances only the local
+replica's component by a positive integer, and `merge` takes the
+component-wise maximum. `compare` returns `"before"`, `"after"`, `"equal"`
+or `"concurrent"`, treating missing components as zero.
+
+```python
+from crdt_sync import VectorClock
+
+a = VectorClock("A")
+b = VectorClock("B")
+a.tick()             # advance the local component
+b.tick(2)
+a.compare(b)         # "concurrent" — each has events the other has not seen
+a.components()       # {"A": 1} — an independent copy
+
+snapshot = a.snapshot()          # JSON-serializable dict
+restored = VectorClock.from_snapshot(snapshot)
+
+a.merge(b)          # in place, returns a; b is left unchanged
+a.tick()
+a.compare(b)        # "after" — a has observed b and then made new progress
+```
+
+Merges are idempotent, commutative, and associative: duplicated, reordered or
+relayed (forwarded through an intermediate replica) snapshots converge to the
+same components, and converged clocks compare as `equal`. Restored clocks
+keep ticking from their already-known local component.
+
