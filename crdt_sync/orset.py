@@ -8,6 +8,15 @@ and the tombstone set only ever grow, and merging takes their union, so
 delivery is idempotent, commutative and associative, stale or duplicated
 snapshots can never resurrect a removed add, and a fresh ``add`` after a
 remove is never swallowed by the historical tombstone.
+
+``compact`` bounds that growth without changing any visible state. For each
+tag origin it finds the longest prefix ``1..n`` whose every add is known
+locally *and* already tombstoned, moves that fully-dead tag history out of
+the snapshot, and records ``n`` as that origin's retired bound in the
+``compacted`` summary. Merging takes the per-origin maximum bound; add and
+tombstone records at or below either side's bound are treated as already
+consumed history, so a late or duplicated pre-compaction snapshot can never
+resurrect a compacted element.
 """
 
 from __future__ import annotations
@@ -47,6 +56,15 @@ def _parse_tag(raw_tag: object) -> Tag:
     return origin, sequence
 
 
+def _parse_bound(value: object) -> int:
+    """Parse one positive-integer retired bound from a JSON snapshot."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("compacted bounds must be positive integers")
+    if value < 1:
+        raise ValueError("compacted bounds must be positive integers")
+    return value
+
+
 class ORSet:
     """An observed-remove set of strings identified by a ``replica_id``."""
 
@@ -55,6 +73,9 @@ class ORSet:
         self._counter = 0
         self._adds: dict[str, set[Tag]] = {}
         self._removes: set[Tag] = set()
+        # Per-origin greatest sequence retired by compaction; absent origins
+        # have no retired prefix. The bound only ever grows (merge takes max).
+        self._compacted: dict[str, int] = {}
 
     @property
     def replica_id(self) -> str:
@@ -101,11 +122,64 @@ class ORSet:
             if any(tag not in self._removes for tag in tags)
         }
 
+    def compact(self) -> int:
+        """Retire the fully-deleted contiguous tag prefix of every origin.
+
+        For each tag origin, retire the longest prefix ``1..n`` such that
+        every one of its adds is present on this replica *and* already
+        covered by a tombstone. Compaction stops at the first gap (a missing
+        add), a still-visible tag, or a tombstone whose add was never
+        observed; it never crosses such a point.
+
+        The retired adds and their per-tag tombstones leave the snapshot
+        state and are summarized by the origin's retired bound; visible
+        elements and add/remove semantics are unchanged. Returns the number
+        of explicit add records removed by this call, which is ``0`` when
+        nothing new can be retired, so a repeated call is a no-op.
+        """
+        # Full locally observed add history, mapped to its owning element.
+        owner: dict[Tag, str] = {}
+        for element, tags in self._adds.items():
+            for tag in tags:
+                owner[tag] = element
+
+        retired_total = 0
+        for origin in sorted({tag_origin for tag_origin, _ in owner}):
+            start = self._compacted.get(origin, 0)
+            sequence = start + 1
+            # Advance only while the next contiguous add exists locally and
+            # is already tombstoned; a gap or a live tag ends the prefix.
+            while (origin, sequence) in owner and (
+                origin,
+                sequence,
+            ) in self._removes:
+                sequence += 1
+            bound = sequence - 1
+            if bound <= start:
+                continue
+            for dead in range(start + 1, bound + 1):
+                tag = (origin, dead)
+                element = owner[tag]
+                tags = self._adds[element]
+                tags.remove(tag)
+                if not tags:
+                    del self._adds[element]
+                self._removes.remove(tag)
+            self._compacted[origin] = bound
+            retired_total += bound - start
+        return retired_total
+
     def merge(self, other: "ORSet") -> "ORSet":
         """Union the tag map and tombstone set with ``other``, in place.
 
         Returns ``self``; ``other`` is never modified. Repeated or reordered
         merges converge to the same state.
+
+        Per-origin retired bounds are joined by maximum; add and tombstone
+        records at or below the joined bound are already-consumed history and
+        are skipped on both sides, so a late pre-compaction snapshot can
+        never resurrect a retired element. Records above the bound follow the
+        normal union rules.
 
         Raises ``ValueError`` — leaving both states untouched — when the
         same tag is bound to different elements on the two sides. Such a
@@ -115,31 +189,72 @@ class ORSet:
         """
         if not isinstance(other, ORSet):
             raise TypeError("can only merge with another ORSet")
-        # A tag identifies one add of one element; before unioning, verify
-        # against the full add history of both sides that no tag changes
-        # ownership across the two states. The check is total, so its
-        # outcome never depends on dict iteration order.
+
+        # Join retired bounds first (component-wise maximum).
+        bounds: dict[str, int] = dict(self._compacted)
+        for origin, bound in other._compacted.items():
+            if bound > bounds.get(origin, 0):
+                bounds[origin] = bound
+
+        def above_bound(tag: Tag) -> bool:
+            origin, sequence = tag
+            return sequence > bounds.get(origin, 0)
+
+        # A tag identifies one add of one element; verify against the full
+        # retained add history of both sides that no tag changes ownership.
+        # Tags at or below a bound are consumed history and take no part.
+        # The check is total, so its outcome never depends on iteration
+        # order, and running it before any mutation keeps failures atomic.
         ownership: dict[Tag, str] = {}
         for element, tags in self._adds.items():
             for tag in tags:
-                ownership[tag] = element
+                if above_bound(tag):
+                    ownership[tag] = element
         conflicts: set[Tag] = set()
+        incoming: list[tuple[str, Tag]] = []
         for element, tags in other._adds.items():
             for tag in tags:
+                if not above_bound(tag):
+                    continue
                 owner = ownership.get(tag)
                 if owner is not None and owner != element:
                     conflicts.add(tag)
+                incoming.append((element, tag))
         if conflicts:
             raise ValueError(
                 "the same tag is bound to different elements: "
                 + ", ".join(repr(tag) for tag in sorted(conflicts))
             )
-        for element, tags in other._adds.items():
-            self._adds.setdefault(element, set()).update(tags)
-        self._removes.update(other._removes)
-        # A state carrying our own replica id (e.g. a restored backup of this
-        # replica) may know about more of our own adds; advance the counter
-        # past every observed tag of ours so future tags stay unique.
+
+        self._compacted = bounds
+
+        # A higher bound learned from ``other`` may retire records this
+        # replica still held explicitly; consume them just like a local
+        # compaction would, so joins converge on one canonical state.
+        for element in list(self._adds):
+            tags = self._adds[element]
+            dead = {tag for tag in tags if not above_bound(tag)}
+            if not dead:
+                continue
+            tags.difference_update(dead)
+            if not tags:
+                del self._adds[element]
+        self._removes = {tag for tag in self._removes if above_bound(tag)}
+
+        # Union the surviving records of ``other`` above the joined bound.
+        for element, tag in incoming:
+            self._adds.setdefault(element, set()).add(tag)
+        for tag in other._removes:
+            if above_bound(tag):
+                self._removes.add(tag)
+
+        # The retired prefix certifies this much of our own add history, and
+        # a state carrying our replica id (e.g. a restored backup) may know
+        # about more of our own adds; advance the counter past every known
+        # own tag so future tags stay unique.
+        own_bound = bounds.get(self._replica_id, 0)
+        if own_bound > self._counter:
+            self._counter = own_bound
         for tags in self._adds.values():
             for origin, sequence in tags:
                 if origin == self._replica_id and sequence > self._counter:
@@ -147,7 +262,13 @@ class ORSet:
         return self
 
     def snapshot(self) -> dict[str, object]:
-        """Return a fresh JSON-serializable snapshot of this set."""
+        """Return a fresh JSON-serializable snapshot of this set.
+
+        The classic four-field shape is used while no compaction summary
+        exists; once at least one origin is retired, a fifth ``compacted``
+        mapping of origin to positive retired bound is appended with keys in
+        stable sorted order.
+        """
         adds = {
             element: [[origin, sequence] for origin, sequence in sorted(tags)]
             for element, tags in sorted(self._adds.items())
@@ -155,28 +276,39 @@ class ORSet:
         removes = [
             [origin, sequence] for origin, sequence in sorted(self._removes)
         ]
-        return {
+        snapshot: dict[str, object] = {
             "replica_id": self._replica_id,
             "counter": self._counter,
             "adds": adds,
             "removes": removes,
         }
+        if self._compacted:
+            snapshot["compacted"] = {
+                origin: self._compacted[origin]
+                for origin in sorted(self._compacted)
+            }
+        return snapshot
 
     @classmethod
     def from_snapshot(cls, snapshot: object) -> "ORSet":
-        """Restore an ORSet from a :meth:`snapshot`-compatible dict."""
+        """Restore an ORSet from a :meth:`snapshot`-compatible dict.
+
+        Both the original four-field shape and the shape that additionally
+        carries a ``compacted`` summary are accepted.
+        """
+        base_keys = {"replica_id", "counter", "adds", "removes"}
         if not isinstance(snapshot, dict):
             raise TypeError("snapshot must be a dict")
 
-        if set(snapshot.keys()) != {
-            "replica_id",
-            "counter",
-            "adds",
-            "removes",
-        }:
+        keys = set(snapshot.keys())
+        if keys == base_keys:
+            has_compacted = False
+        elif keys == base_keys | {"compacted"}:
+            has_compacted = True
+        else:
             raise ValueError(
                 "snapshot must contain exactly 'replica_id', 'counter', "
-                "'adds' and 'removes'"
+                "'adds' and 'removes', and optionally 'compacted'"
             )
 
         replica_id = snapshot["replica_id"]
@@ -188,6 +320,18 @@ class ORSet:
             raise ValueError("counter must be a non-negative integer")
         if counter < 0:
             raise ValueError("counter must be a non-negative integer")
+
+        compacted: dict[str, int] = {}
+        if has_compacted:
+            raw_compacted = snapshot["compacted"]
+            if not isinstance(raw_compacted, dict):
+                raise ValueError("compacted must be a dict")
+            for origin, raw_bound in raw_compacted.items():
+                if not isinstance(origin, str) or origin == "":
+                    raise ValueError(
+                        "compacted keys must be non-empty origin strings"
+                    )
+                compacted[origin] = _parse_bound(raw_bound)
 
         raw_adds = snapshot["adds"]
         if not isinstance(raw_adds, dict):
@@ -221,17 +365,37 @@ class ORSet:
         for raw_tag in raw_removes:
             removes.add(_parse_tag(raw_tag))
 
-        # Causal validity: a tombstone may only refer to an observed add...
-        if not removes <= set(tag_owner):
+        # Explicit records at or below a retired bound are already-consumed
+        # history and must have been removed, not shipped again.
+        for origin, sequence in (*tag_owner, *removes):
+            if sequence <= compacted.get(origin, 0):
+                raise ValueError(
+                    "explicit tags must lie above the compacted bound"
+                )
+
+        # Causal validity: a tombstone may only refer to an observed add or
+        # to the certified compacted prefix (known history without records).
+        def observed(tag: Tag) -> bool:
+            origin, sequence = tag
+            return tag in tag_owner or sequence <= compacted.get(origin, 0)
+
+        if not all(observed(tag) for tag in removes):
             raise ValueError("removes references a tag with no matching add")
-        # ...and the local counter must describe exactly this replica's own
-        # observed add history (1..counter, no gaps, no unknown future tags).
+
+        # The local counter must describe exactly this replica's own add
+        # history: the retired prefix 1..bound plus the explicit tags
+        # bound+1..counter, with no gaps and no unknown future tags.
+        own_bound = compacted.get(replica_id, 0)
+        if own_bound > counter:
+            raise ValueError(
+                "counter is inconsistent with the replica's add history"
+            )
         own_sequences = sorted(
             sequence
             for origin, sequence in tag_owner
             if origin == replica_id
         )
-        if own_sequences != list(range(1, counter + 1)):
+        if own_sequences != list(range(own_bound + 1, counter + 1)):
             raise ValueError(
                 "counter is inconsistent with the replica's add history"
             )
@@ -240,6 +404,7 @@ class ORSet:
         restored._counter = counter
         restored._adds = adds
         restored._removes = removes
+        restored._compacted = compacted
         return restored
 
     def __repr__(self) -> str:

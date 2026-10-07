@@ -52,6 +52,15 @@ def state(snapshot: dict) -> tuple:
     )
 
 
+def canonical(snapshot: dict) -> tuple:
+    """Replica-independent state including the compaction summary."""
+    return (
+        json.dumps(snapshot["adds"], sort_keys=True),
+        json.dumps(snapshot["removes"], sort_keys=True),
+        json.dumps(snapshot.get("compacted", {}), sort_keys=True),
+    )
+
+
 def build_scenario():
     """Return ``(history, finals, expected_elements)``.
 
@@ -843,6 +852,587 @@ class ValidationTests(unittest.TestCase):
                     "removes": [["a", 1]],
                 }
             )
+
+
+class CompactSemanticsTests(unittest.TestCase):
+    """compact() retires only the fully-dead contiguous per-origin prefix."""
+
+    def test_empty_and_undeleted_replicas_compact_to_zero(self) -> None:
+        self.assertEqual(ORSet("r").compact(), 0)
+        replica = ORSet("r")
+        replica.add("a")
+        replica.add("b")
+        # Visible tags cannot be retired.
+        self.assertEqual(replica.compact(), 0)
+        self.assertEqual(replica.elements(), {"a", "b"})
+        self.assertNotIn("compacted", replica.snapshot())
+
+    def test_compact_removes_dead_prefix_and_reports_count(self) -> None:
+        replica = ORSet("r")
+        replica.add("a")  # tag 1
+        replica.add("b")  # tag 2
+        replica.add("c")  # tag 3
+        replica.remove("a")
+        replica.remove("b")
+        # c is still visible; the dead prefix is tags 1 and 2.
+        self.assertEqual(replica.elements(), {"c"})
+        self.assertEqual(replica.compact(), 2)
+        self.assertEqual(replica.elements(), {"c"})
+        self.assertTrue(replica.contains("c"))
+        self.assertFalse(replica.contains("a"))
+        snapshot = replica.snapshot()
+        self.assertEqual(snapshot["compacted"], {"r": 2})
+        self.assertEqual(snapshot["adds"], {"c": [["r", 3]]})
+        self.assertEqual(snapshot["removes"], [])
+
+    def test_repeated_compact_returns_zero(self) -> None:
+        replica = ORSet("r")
+        replica.add("a")
+        replica.remove("a")
+        self.assertEqual(replica.compact(), 1)
+        self.assertEqual(replica.compact(), 0)
+        self.assertEqual(replica.compact(), 0)
+        self.assertEqual(replica.snapshot()["compacted"], {"r": 1})
+
+    def test_gap_blocks_prefix_even_when_later_tag_is_dead(self) -> None:
+        # Tag 1 visible, tag 2 dead: no prefix from sequence 1 is retireable.
+        replica = ORSet.from_snapshot(
+            {
+                "replica_id": "r",
+                "counter": 2,
+                "adds": {"a": [["r", 1]], "b": [["r", 2]]},
+                "removes": [["r", 2]],
+            }
+        )
+        self.assertEqual(replica.compact(), 0)
+        self.assertNotIn("compacted", replica.snapshot())
+
+        # Once tag 1 is also deleted the whole prefix retires together.
+        self.assertTrue(replica.remove("a"))
+        self.assertEqual(replica.compact(), 2)
+        self.assertEqual(replica.snapshot()["compacted"], {"r": 2})
+
+    def test_compact_distinguishes_origins(self) -> None:
+        local = ORSet("a")
+        local.add("a1")
+        local.remove("a1")
+        remote = ORSet("b")
+        remote.add("b1")
+        remote.add("b2")
+        remote.remove("b1")  # b: tag1 dead, tag2 live
+        local.merge(remote)
+        # a's dead tag 1 retires; b's dead tag 1 also forms a retireable
+        # prefix even though b's tag 2 is still live (the prefix stops at 2).
+        self.assertEqual(local.compact(), 2)
+        snapshot = local.snapshot()
+        self.assertEqual(snapshot["compacted"], {"a": 1, "b": 1})
+        self.assertEqual(snapshot["adds"], {"b2": [["b", 2]]})
+        self.assertEqual(snapshot["removes"], [])
+        self.assertEqual(local.elements(), {"b2"})
+
+    def test_compact_advances_incrementally_as_prefix_grows(self) -> None:
+        replica = ORSet("r")
+        replica.add("a")
+        replica.remove("a")
+        self.assertEqual(replica.compact(), 1)
+        replica.add("b")
+        replica.add("c")
+        replica.remove("b")
+        # tag 2 now dead, tag 3 live -> extend the bound from 1 to 2.
+        self.assertEqual(replica.compact(), 1)
+        self.assertEqual(replica.snapshot()["compacted"], {"r": 2})
+        replica.remove("c")
+        self.assertEqual(replica.compact(), 1)
+        self.assertEqual(replica.snapshot()["compacted"], {"r": 3})
+        self.assertEqual(replica.elements(), set())
+
+    def test_add_after_compact_keeps_unique_tags_and_survives(self) -> None:
+        replica = ORSet("r")
+        replica.add("a")
+        replica.remove("a")
+        replica.compact()
+        replica.add("a")  # re-add must mint tag 2, not reuse retired tag 1
+        self.assertTrue(replica.contains("a"))
+        snapshot = replica.snapshot()
+        self.assertEqual(snapshot["adds"], {"a": [["r", 2]]})
+        self.assertEqual(snapshot["compacted"], {"r": 1})
+
+    def test_unobserved_remote_remove_blocks_remote_prefix(self) -> None:
+        # alpha deletes its tag; a peer that has only seen the add (not the
+        # remove) must not retire alpha's prefix.
+        alpha = ORSet("alpha")
+        alpha.add("x")
+        alpha.remove("x")
+        alpha.compact()
+
+        beta = ORSet("beta")
+        alpha_add_only = ORSet("alpha")
+        alpha_add_only.add("x")
+        beta.merge(alpha_add_only)  # sees the live add, never the remove
+        beta.merge(wire_restore(alpha.snapshot()))  # learns the bound
+        # The bound certifies the dead prefix without beta having held the
+        # tombstone; beta converges and cannot resurrect x.
+        self.assertEqual(beta.elements(), set())
+        self.assertEqual(beta.snapshot()["compacted"], {"alpha": 1})
+        beta.merge(alpha_add_only)  # stale live add redelivered
+        self.assertEqual(beta.elements(), set())
+
+
+class CompactMergeTests(unittest.TestCase):
+    """Merging compacted and uncompacted replicas in any order/direction."""
+
+    def setUp(self) -> None:
+        # alpha: tags 1-3 (x dead, y dead, z live); beta observes it all,
+        # adds its own dead prefix, then the two diverge pre/post compaction.
+        self.alpha = ORSet("alpha")
+        self.alpha.add("x")
+        self.alpha.add("y")
+        self.alpha.add("z")
+        self.alpha.remove("x")
+        self.alpha.remove("y")
+        self.beta = ORSet("beta")
+        self.beta.merge(wire_restore(self.alpha.snapshot()))
+        self.beta.add("p")
+        self.beta.remove("p")
+        # Fresh uncompacted captures for replay.
+        self.alpha_raw = cap(self.alpha)
+        self.beta_raw = cap(self.beta)
+
+    def _converged_pair(self):
+        alpha = wire_restore(self.alpha_raw)
+        beta = wire_restore(self.beta_raw)
+        alpha.compact()
+        # beta stays uncompacted; merge both directions via snapshots.
+        beta.merge(wire_restore(alpha.snapshot()))
+        alpha.merge(wire_restore(beta.snapshot()))
+        # Compact the dead history each side now holds, then re-converge so
+        # both replicas share the fully compacted canonical state.
+        alpha.compact()
+        beta.compact()
+        beta.merge(wire_restore(alpha.snapshot()))
+        alpha.merge(wire_restore(beta.snapshot()))
+        beta.merge(wire_restore(alpha.snapshot()))
+        return alpha, beta
+
+    def test_bidirectional_merge_converges_canonically(self) -> None:
+        alpha, beta = self._converged_pair()
+        self.assertEqual(alpha.elements(), {"z"})
+        self.assertEqual(beta.elements(), {"z"})
+        self.assertEqual(
+            canonical(alpha.snapshot()), canonical(beta.snapshot())
+        )
+
+    def test_compact_before_or_after_merge_agrees(self) -> None:
+        # Compact only after the full exchange vs. before: same causal state.
+        first = wire_restore(self.alpha_raw)
+        second = wire_restore(self.beta_raw)
+        first.compact()
+        second.merge(wire_restore(first.snapshot()))
+        first.merge(wire_restore(second.snapshot()))
+        first.compact()
+        second.compact()
+        first.merge(wire_restore(second.snapshot()))
+        second.merge(wire_restore(first.snapshot()))
+        self.assertEqual(
+            canonical(first.snapshot()), canonical(second.snapshot())
+        )
+        self.assertEqual(first.elements(), {"z"})
+
+    def test_stale_uncompacted_snapshot_cannot_resurrect(self) -> None:
+        alpha, beta = self._converged_pair()
+        before = canonical(alpha.snapshot())
+        # Replay the old pre-compaction states many times, both directions.
+        for stale in (self.alpha_raw, self.beta_raw) * 3:
+            alpha.merge(wire_restore(stale))
+            beta.merge(wire_restore(stale))
+        self.assertEqual(canonical(alpha.snapshot()), before)
+        self.assertEqual(canonical(beta.snapshot()), before)
+        self.assertEqual(alpha.elements(), {"z"})
+        self.assertEqual(beta.elements(), {"z"})
+
+    def test_bound_join_takes_maximum(self) -> None:
+        alpha, beta = self._converged_pair()
+        # alpha retired 1..2 for itself; beta observed that bound. Extend
+        # alpha's dead prefix further and re-merge.
+        alpha.remove("z")
+        self.assertEqual(alpha.compact(), 1)  # bound alpha 2 -> 3
+        beta.merge(wire_restore(alpha.snapshot()))
+        self.assertEqual(beta.snapshot()["compacted"]["alpha"], 3)
+        self.assertEqual(beta.elements(), set())
+
+    def test_higher_bound_consumes_locally_held_records(self) -> None:
+        # An uncompacted replica holding the same dead prefix learns the bound
+        # from its compacted twin and drops the records, converging to the
+        # compacted shape.
+        holder = wire_restore(self.alpha_raw)  # holds alpha tags 1-3
+        compactor = wire_restore(self.alpha_raw)
+        compactor.compact()
+        self.assertIn(["alpha", 1], holder.snapshot()["removes"])
+        holder.merge(wire_restore(compactor.snapshot()))
+        self.assertEqual(
+            canonical(holder.snapshot()), canonical(compactor.snapshot())
+        )
+        self.assertNotIn("x", holder.snapshot()["adds"])
+        self.assertEqual(holder.snapshot()["removes"], [])
+        self.assertEqual(holder.snapshot()["compacted"], {"alpha": 2})
+
+    def test_converged_replicas_keep_adding_and_removing(self) -> None:
+        alpha, beta = self._converged_pair()
+        alpha.add("q")
+        alpha.remove("z")
+        beta.merge(wire_restore(alpha.snapshot()))
+        alpha.merge(wire_restore(beta.snapshot()))
+        self.assertEqual(alpha.elements(), {"q"})
+        self.assertEqual(beta.elements(), {"q"})
+        self.assertEqual(
+            canonical(alpha.snapshot()), canonical(beta.snapshot())
+        )
+
+    def test_merge_algebra_holds_with_compaction(self) -> None:
+        states = []
+        for raw in (self.alpha_raw, self.beta_raw):
+            plain = wire_restore(raw)
+            states.append(plain)
+            compacted = wire_restore(raw)
+            compacted.compact()
+            states.append(compacted)
+
+        def join(owner, ordering):
+            receiver = ORSet(owner)
+            for peer in ordering:
+                receiver.merge(wire_restore(peer.snapshot()))
+            return receiver
+
+        baseline = join("base", states)
+        for index, ordering in enumerate(permutations(states)):
+            with self.subTest(order=index):
+                receiver = join(f"recv-{index}", ordering)
+                self.assertEqual(
+                    canonical(receiver.snapshot()),
+                    canonical(baseline.snapshot()),
+                )
+
+    def test_counter_advances_via_learned_own_bound(self) -> None:
+        # A stale backup of alpha (counter behind) learns alpha's higher bound
+        # from a compacted peer and must not mint a colliding tag.
+        live = ORSet("alpha")
+        live.add("a")
+        live.add("b")
+        live.remove("a")
+        live.remove("b")
+        backup = wire_restore(cap(live))  # counter frozen at 2
+        live.add("c")
+        live.remove("c")
+        live.compact()  # bound alpha -> 3
+        backup.merge(wire_restore(live.snapshot()))
+        backup.add("d")
+        everyone = ORSet("observer")
+        everyone.merge(wire_restore(live.snapshot()))
+        everyone.merge(backup)
+        self.assertEqual(everyone.elements(), {"d"})
+        origins = sorted(
+            seq
+            for tags in everyone.snapshot()["adds"].values()
+            for origin, seq in tags
+            if origin == "alpha"
+        )
+        self.assertEqual(origins, [4])
+
+
+class CompactScenarioConvergenceTests(unittest.TestCase):
+    """The shared multi-replica scenario survives compaction at every stage."""
+
+    def test_mixing_compacted_and_plain_finals_converges(self) -> None:
+        history, finals, expected = build_scenario()
+
+        # Fully compacted reference causal state.
+        reference = deliver(ORSet("reference"), finals)
+        reference.compact()
+        reference_state = canonical(reference.snapshot())
+
+        def compacted_cap(snapshot: dict) -> dict:
+            replica = wire_restore(snapshot)
+            replica.compact()
+            return cap(replica)
+
+        variants = [(final, compacted_cap(final)) for final in finals]
+        # For each choice of plain/compacted copy, every delivery order must
+        # converge to the same state; visible elements are always identical.
+        for mask in range(1 << len(finals)):
+            chosen = [variants[i][(mask >> i) & 1] for i in range(len(finals))]
+            states = set()
+            for order in permutations(chosen):
+                receiver = deliver(ORSet("observer"), order)
+                self.assertEqual(receiver.elements(), expected)
+                states.add(canonical(receiver.snapshot()))
+            self.assertEqual(
+                len(states), 1, f"order-dependent state for mask {mask}"
+            )
+        # Once every final is observed in compacted form, the result matches
+        # the compacted reference exactly.
+        fully_compacted = [compacted_cap(final) for final in finals]
+        receiver = deliver(ORSet("observer"), fully_compacted)
+        self.assertEqual(canonical(receiver.snapshot()), reference_state)
+
+    def test_stale_history_after_compacted_finals_cannot_resurrect(self) -> None:
+        history, finals, expected = build_scenario()
+        compacted_finals = []
+        for final in finals:
+            replica = wire_restore(final)
+            replica.compact()
+            compacted_finals.append(cap(replica))
+
+        receiver = deliver(ORSet("observer"), compacted_finals)
+        before = canonical(receiver.snapshot())
+        deliver(receiver, history * 2)
+        self.assertEqual(canonical(receiver.snapshot()), before)
+        self.assertEqual(receiver.elements(), expected)
+
+
+class CompactSnapshotTests(unittest.TestCase):
+    """Snapshot shape, JSON round trips and from_snapshot validation."""
+
+    def _compacted(self) -> ORSet:
+        replica = ORSet("a")
+        replica.add("x")
+        replica.add("y")
+        replica.remove("x")
+        replica.compact()
+        return replica
+
+    def test_old_four_field_shape_unchanged_without_compaction(self) -> None:
+        replica = ORSet("a")
+        replica.add("x")
+        replica.remove("x")
+        self.assertEqual(
+            set(replica.snapshot().keys()),
+            {"replica_id", "counter", "adds", "removes"},
+        )
+
+    def test_compacted_shape_round_trips_through_json(self) -> None:
+        replica = self._compacted()
+        data = cap(replica)
+        self.assertEqual(
+            set(data.keys()),
+            {"replica_id", "counter", "adds", "removes", "compacted"},
+        )
+        restored = wire_restore(data)
+        self.assertEqual(restored.snapshot(), data)
+        self.assertEqual(restored.snapshot()["compacted"], {"a": 1})
+        self.assertEqual(restored.elements(), {"y"})
+
+    def test_old_shape_still_restores(self) -> None:
+        old = {
+            "replica_id": "a",
+            "counter": 1,
+            "adds": {"x": [["a", 1]]},
+            "removes": [],
+        }
+        restored = ORSet.from_snapshot(copy.deepcopy(old))
+        self.assertEqual(restored.snapshot(), old)
+
+    def test_present_empty_compacted_is_treated_as_no_summary(self) -> None:
+        old = {
+            "replica_id": "a",
+            "counter": 1,
+            "adds": {"x": [["a", 1]]},
+            "removes": [],
+            "compacted": {},
+        }
+        restored = ORSet.from_snapshot(copy.deepcopy(old))
+        # An empty summary is vacuous: output reverts to the four-field shape.
+        self.assertNotIn("compacted", restored.snapshot())
+        self.assertEqual(restored.elements(), {"x"})
+
+    def test_compacted_keys_emit_in_sorted_order(self) -> None:
+        replica = ORSet("local")
+        other = ORSet("zeta")
+        other.add("z")
+        other.remove("z")
+        alpha = ORSet("alpha")
+        alpha.add("q")
+        alpha.remove("q")
+        replica.merge(other)
+        replica.merge(alpha)
+        replica.add("m")
+        replica.remove("m")
+        replica.compact()
+        self.assertEqual(
+            list(replica.snapshot()["compacted"].keys()),
+            ["alpha", "local", "zeta"],
+        )
+
+    # Invalid compacted payloads.
+    def test_compacted_must_be_a_dict(self) -> None:
+        base = {
+            "replica_id": "a",
+            "counter": 0,
+            "adds": {},
+            "removes": [],
+        }
+        for bad in (None, [], "", 42, True, (), {1, 2}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ORSet.from_snapshot({**base, "compacted": bad})
+
+    def test_compacted_keys_must_be_non_empty_strings(self) -> None:
+        base = {
+            "replica_id": "a",
+            "counter": 0,
+            "adds": {},
+            "removes": [],
+        }
+        # A non-string or empty origin is rejected (unhashable keys cannot
+        # appear in a JSON-shaped dict at all).
+        for bad_key in ("", 1, None, True):
+            with self.subTest(bad_key=bad_key):
+                with self.assertRaises(ValueError):
+                    ORSet.from_snapshot({**base, "compacted": {bad_key: 1}})
+
+    def test_compacted_bounds_must_be_positive_integers(self) -> None:
+        base = {
+            "replica_id": "a",
+            "counter": 0,
+            "adds": {},
+            "removes": [],
+        }
+        for bad_bound in (0, -1, 1.0, "1", None, True, False, [], {}):
+            with self.subTest(bad_bound=bad_bound):
+                with self.assertRaises(ValueError):
+                    ORSet.from_snapshot(
+                        {**base, "compacted": {"x": bad_bound}}
+                    )
+
+    def test_extra_top_level_field_rejected(self) -> None:
+        good = cap(self._compacted())
+        with self.assertRaises(ValueError):
+            ORSet.from_snapshot({**good, "extra": 1})
+
+    def test_explicit_tag_at_or_below_bound_rejected(self) -> None:
+        # An add record at the bound is already-consumed history.
+        with self.assertRaises(ValueError):
+            ORSet.from_snapshot(
+                {
+                    "replica_id": "a",
+                    "counter": 2,
+                    "adds": {"x": [["a", 1]], "y": [["a", 2]]},
+                    "removes": [],
+                    "compacted": {"a": 1},
+                }
+            )
+        # A tombstone at or below the bound is likewise rejected.
+        with self.assertRaises(ValueError):
+            ORSet.from_snapshot(
+                {
+                    "replica_id": "a",
+                    "counter": 2,
+                    "adds": {"y": [["a", 2]]},
+                    "removes": [["a", 1]],
+                    "compacted": {"a": 1},
+                }
+            )
+
+    def test_bound_covers_causal_and_counter_checks(self) -> None:
+        # Tombstone referring into the certified prefix is fine; counter
+        # equals the own bound with no explicit own tags.
+        restored = ORSet.from_snapshot(
+            {
+                "replica_id": "a",
+                "counter": 2,
+                "adds": {"k": [["b", 1]]},
+                "removes": [],
+                "compacted": {"a": 2},
+            }
+        )
+        self.assertEqual(restored.elements(), {"k"})
+
+        # Counter below the own bound is invalid.
+        with self.assertRaises(ValueError):
+            ORSet.from_snapshot(
+                {
+                    "replica_id": "a",
+                    "counter": 1,
+                    "adds": {},
+                    "removes": [],
+                    "compacted": {"a": 2},
+                }
+            )
+        # Gap between the bound and explicit own tags is invalid.
+        with self.assertRaises(ValueError):
+            ORSet.from_snapshot(
+                {
+                    "replica_id": "a",
+                    "counter": 3,
+                    "adds": {"x": [["a", 3]]},
+                    "removes": [],
+                    "compacted": {"a": 1},
+                }
+            )
+        # A tombstone above the bound still needs its explicit add.
+        with self.assertRaises(ValueError):
+            ORSet.from_snapshot(
+                {
+                    "replica_id": "a",
+                    "counter": 1,
+                    "adds": {"x": [["a", 1]]},
+                    "removes": [["b", 5]],
+                }
+            )
+
+    def test_ownership_conflict_above_bound_still_detected(self) -> None:
+        left = ORSet("a")
+        left.merge(
+            ORSet.from_snapshot(
+                {
+                    "replica_id": "x",
+                    "counter": 2,
+                    "adds": {"two": [["x", 2]]},
+                    "removes": [],
+                    "compacted": {"x": 1},
+                }
+            )
+        )
+        # Same surviving tag x:2 bound to a different element -> ValueError.
+        conflicting = ORSet.from_snapshot(
+            {
+                "replica_id": "y",
+                "counter": 0,
+                "adds": {"other": [["x", 2]]},
+                "removes": [],
+                "compacted": {"x": 1},
+            }
+        )
+        before = left.snapshot()
+        with self.assertRaises(ValueError):
+            left.merge(conflicting)
+        # A rejected merge is atomic: no records and, critically, no bound
+        # advancement from the conflicting side.
+        self.assertEqual(left.snapshot(), before)
+
+    def test_conflict_below_bound_is_ignored_not_raised(self) -> None:
+        # A colliding tag that both sides certify as retired is consumed
+        # history and must not trigger a conflict or resurrect anything.
+        left = ORSet.from_snapshot(
+            {
+                "replica_id": "r",
+                "counter": 1,
+                "adds": {"keep": [["r", 1]]},
+                "removes": [],
+                "compacted": {"x": 2},
+            }
+        )
+        right = ORSet.from_snapshot(
+            {
+                "replica_id": "s",
+                "counter": 0,
+                "adds": {"ghost": [["x", 1]]},
+                "removes": [["x", 1]],
+                "compacted": {},
+            }
+        )
+        left.merge(right)  # x:1 below left's bound -> ignored
+        self.assertEqual(left.elements(), {"keep"})
+        self.assertEqual(left.snapshot()["compacted"], {"x": 2})
 
 
 class PackageSurfaceTests(unittest.TestCase):

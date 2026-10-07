@@ -36,10 +36,9 @@ assertion text reports seed, CRDT type, the raw op trace, the actual
 delivery trace, the first divergence, and a shrunk JSON script that can be
 replayed directly via :func:`replay_script_by_name`.
 
-No tombstone-compaction entry is published in this baseline, so no
-compaction test and no test-only substitute implementation is added;
-``CompactionScopeTests`` pins the published scope so adding such an entry
-later is a deliberate decision.
+Tombstone compaction is published only on ORSet; GCounter, LWWRegister and
+RGA still expose no compaction entry. ``CompactionScopeTests`` pins that
+scope so extending compaction to another CRDT is a deliberate decision.
 """
 
 from __future__ import annotations
@@ -1279,15 +1278,15 @@ class HandBuiltConcurrencyTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Published scope: no tombstone-compaction entry exists in this baseline
+# Published scope: tombstone compaction exists only on ORSet
 # ---------------------------------------------------------------------------
 
 
 class CompactionScopeTests(unittest.TestCase):
     BANNED = ("compact", "compaction", "compress", "prune", "purge", "gc")
 
-    def test_no_compaction_entry_is_published_on_any_crdt(self) -> None:
-        for cls in (GCounter, ORSet, LWWRegister, RGA):
+    def test_compaction_is_published_only_on_orset(self) -> None:
+        for cls in (GCounter, LWWRegister, RGA):
             with self.subTest(crdt=cls.__name__):
                 public_names = [
                     name for name in dir(cls) if not name.startswith("_")
@@ -1298,6 +1297,9 @@ class CompactionScopeTests(unittest.TestCase):
                     if any(word in name.lower() for word in self.BANNED)
                 ]
                 self.assertEqual(offenders, [])
+        # ORSet is the single CRDT that publishes a compaction entry.
+        self.assertTrue(hasattr(ORSet, "compact"))
+        self.assertTrue(callable(getattr(ORSet, "compact")))
 
     def test_package_exports_only_the_crdts_clock_and_version(self) -> None:
         import crdt_sync

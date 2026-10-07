@@ -68,6 +68,42 @@ Merges are idempotent, commutative, and associative: stale, duplicated or
 reordered snapshots converge to the same elements and can never resurrect a
 removed addition.
 
+### Compaction
+
+The add and tombstone history only grows, so long-lived replicas accumulate
+records for elements long since deleted. `compact()` reclaims that space
+without changing any visible element or add/remove semantics. For each tag
+origin it finds the longest prefix `1..n` whose every add is present locally
+*and* already covered by a tombstone, moves those adds and per-tag
+tombstones out of the state, and records `n` as that origin's retired bound
+in a bounded `compacted` summary. It stops at the first gap, a still-visible
+tag, or a tombstone whose add was never observed, and returns the number of
+add records removed; a repeated call returns `0`.
+
+```python
+a.add("apple"); a.add("banana")
+a.remove("apple")
+a.compact()        # 1 — retires apple's fully-dead tag
+a.compact()        # 0 — nothing new to retire
+a.elements()       # {"banana"} — unchanged
+```
+
+On merge the per-origin retired bounds join by maximum; add and tombstone
+records at or below a bound are treated as already-consumed history, so a
+late or duplicated pre-compaction snapshot can never resurrect a retired
+element. Records above the bound merge as before, and ownership conflicts and
+the local tag counter keep working. Compacted and uncompacted replicas,
+exchanged in any order or direction, converge to the same elements and to the
+same canonical causal state apart from the per-replica `replica_id`/`counter`,
+and can keep adding and removing afterwards.
+
+A snapshot uses the original four fields until compaction occurs; once a
+summary exists it additionally carries `compacted`, a mapping of origin
+replica id to its positive retired bound, with keys sorted. `from_snapshot`
+accepts both the old and the new shape and preserves the summary across a
+JSON round trip; explicit tags at or below a bound, like any other malformed
+summary, are rejected.
+
 ## LWWRegister
 
 A last-writer-wins register CRDT for offline-writable JSON values. Each
