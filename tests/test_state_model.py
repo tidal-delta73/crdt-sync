@@ -1311,6 +1311,7 @@ class CompactionScopeTests(unittest.TestCase):
                 "ORSet",
                 "LWWRegister",
                 "RGA",
+                "RGASession",
                 "VectorClock",
                 "__version__",
             },

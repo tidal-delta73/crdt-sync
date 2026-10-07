@@ -217,3 +217,42 @@ and associative, so duplicate, reordered or intermediate-relayed state
 exchanges converge to identical components, and converged clocks compare as
 `equal`.
 
+## RGASession
+
+A session bundling one RGA sequence replica and its vector clock under a
+single `replica_id`, so the editable sequence and its causal context travel
+as one offline-editing and reconnect unit. `insert`/`delete`/`values` behave
+exactly as on a bare `RGA`; every successful edit additionally ticks the
+session clock once, while a failed edit changes neither the sequence nor the
+clock.
+
+```python
+from crdt_sync import RGASession
+
+a = RGASession("A")
+a.insert(0, "he")
+a.insert(1, "llo")
+a.values()            # ["he", "llo"]
+
+snapshot = a.snapshot()           # one JSON-serializable exchange package:
+                                  # {"replica_id", "rga", "clock"}, all "A"
+restored = RGASession.from_snapshot(snapshot)
+
+b = RGASession("B")
+relation = b.merge(a)  # "after" — the peer is ahead; b absorbs both the
+                       # sequence and the causal context, keeps its own id
+```
+
+`merge` first decides the peer's causal relation to the receiver
+(`before`/`after`/`equal`/`concurrent`) from the two clocks, then merges
+sequence and clock together and returns that relation. The merge is atomic:
+a conflicting shared node id raises `ValueError` with the receiver's
+sequence *and* clock untouched, and a non-session argument raises
+`TypeError`. Snapshots are deeply independent and round-trip through JSON;
+`from_snapshot` raises `ValueError` on missing or extra fields, invalid
+nested snapshots, or disagreeing `replica_id` values, and a restored session
+keeps its Lamport counter and clock components so continued editing never
+reuses a node id or rolls the clock back. Exchanging session snapshots in
+any order, with duplicates, converges every replica to the same `values()`,
+shared RGA records and clock components.
+
