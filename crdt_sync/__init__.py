@@ -4,6 +4,7 @@ from .gcounter import GCounter
 from .lww_register import LWWRegister
 from .orset import ORSet
 from .rga import RGA
+from .rga_session import RGASession
 from .vector_clock import VectorClock
 
 __version__ = "0.1.0"
