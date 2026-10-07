@@ -256,3 +256,54 @@ reuses a node id or rolls the clock back. Exchanging session snapshots in
 any order, with duplicates, converges every replica to the same `values()`,
 shared RGA records and clock components.
 
+### Causal compaction
+
+Every successful `delete` is recorded under the clock dot it mints, so a
+session snapshot carries mergeable deletion *causality*, not just a
+tombstone set. `compact(stable_clock)` reclaims deleted RGA nodes against a
+stability frontier the caller supplies — a `VectorClock` built from the
+acknowledgements of every participant currently syncing, i.e. the clock
+every one of them has confirmed observing:
+
+```python
+a.insert(0, "he"); a.insert(1, "llo"); a.delete(1)
+stable = ...        # VectorClock all participants have acknowledged
+a.compact(stable)   # count of node value records physically removed
+a.compact(stable)   # 0 — the same frontier retires nothing new
+```
+
+A node is reclaimed only when one of its deletion events is covered by the
+frontier, it is not a legacy tombstone without causal information, and no
+node surviving as a full record still names it as predecessor. Eligible
+leaves are peeled repeatedly, so a whole stable deleted branch comes away in
+one call, while compaction never crosses a live node, an unstabilized
+delete, or a still-referenced node. The call never advances the session
+clock and never changes `values()`.
+
+A reclaimed node's value record disappears (that count is the return
+value), but a permanent *retired summary* remains: the node id with its
+predecessor edge as a tombstoned skeleton (so a branch that still hangs off
+the node keeps weaving in place), the retired deletion dots, and a
+per-origin retired clock prefix. Consequently an old pre-compaction
+snapshot, a duplicate packet or an out-of-order delivery cannot resurrect
+a retired node, and a compacted replica merging an uncompacted one — in
+either direction — converges on the same visible sequence, clock and
+shared snapshot content (each replica keeping only its own `replica_id`).
+The bare `RGA` has no compaction entry point and is otherwise unchanged.
+
+`compact` raises `TypeError` when its argument is not a `VectorClock`, and
+`ValueError` — leaving the session completely unchanged — when the frontier
+is concurrent with or ahead of the session clock. A same node id carrying
+conflicting content still raises `ValueError` on merge, with the sequence,
+clock and compaction metadata kept atomic.
+
+The session snapshot keeps the original three fields until a node is
+retired; afterwards it additionally carries a deterministic `compaction`
+summary. Deletion causality rides on the tombstones: a tagged tombstone is
+`[id, [[origin, counter], ...]]` while a tombstone restored from a legacy
+plain-id snapshot stays `[sequence, origin]`, carries no deletion time and
+is treated as permanently ineligible for compaction. Both the legacy
+three-field session shape and the legacy four-field RGA snapshot are still
+accepted with their original merge, continued-editing and exception
+semantics.
+

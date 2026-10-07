@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 
 from crdt_sync import RGA, RGASession, VectorClock
+from crdt_sync.rga_session import _RETIRED
 
 
 def wire(snapshot: object) -> object:
@@ -20,6 +22,28 @@ def normalized(snapshot: object) -> str:
 
 def restore(snapshot: object) -> RGASession:
     return RGASession.from_snapshot(wire(snapshot))
+
+
+def frontier(session: RGASession) -> VectorClock:
+    """A stability frontier equal to the session's observed clock."""
+    clock = VectorClock("frontier")
+    clock.merge(session._clock)
+    return clock
+
+
+def is_skeleton(session: RGASession, node_id: tuple[int, str]) -> bool:
+    record = session._rga._nodes.get(node_id)
+    return record is not None and record[0] is _RETIRED
+
+
+def shared_view(session: RGASession) -> object:
+    """Everything about a session snapshot except its own replica ids."""
+    snapshot = session.snapshot()
+    rga = {key: value for key, value in snapshot["rga"].items()
+           if key != "replica_id"}
+    clock = snapshot["clock"]["clock"]
+    return {"rga": rga, "clock": clock, "compaction": snapshot.get("compaction")}
+
 
 
 class ConstructionTests(unittest.TestCase):
@@ -328,6 +352,473 @@ class MergeTests(unittest.TestCase):
         a.merge(restore(a.snapshot()))
         self.assertEqual(normalized(a.snapshot()), before)
         self.assertEqual(a.values(), ["y"])
+
+
+class CompactValidationTests(unittest.TestCase):
+    def test_stable_clock_must_be_a_vector_clock(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.delete(0)
+        for bad in (None, 1, 1.5, "clock", [], {}):
+            with self.subTest(bad=bad):
+                self.assertRaises(TypeError, session.compact, bad)
+
+    def test_empty_session_compacts_to_zero(self) -> None:
+        self.assertEqual(RGASession("A").compact(VectorClock("S")), 0)
+
+    def test_frontier_ahead_or_concurrent_raises_and_changes_nothing(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.delete(0)
+
+        ahead = VectorClock("S")
+        ahead.merge(session._clock)
+        ahead.tick()  # claims a delete the session never observed
+
+        concurrent = VectorClock("S")
+        concurrent.merge(session._clock)
+        concurrent._components["Q"] = 1
+        concurrent._components["A"] = 0
+
+        for bad in (ahead, concurrent):
+            with self.subTest(bad=bad.components()):
+                before = wire(session.snapshot())
+                self.assertRaises(ValueError, session.compact, bad)
+                self.assertEqual(session.snapshot(),
+                                 RGASession.from_snapshot(before).snapshot())
+                self.assertEqual(session.values(), [])
+
+    def test_frontier_equal_or_behind_is_accepted(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.delete(0)
+        self.assertEqual(session.compact(frontier(session)), 1)
+        # An empty frontier is strictly behind; it is a valid no-op.
+        self.assertEqual(session.compact(VectorClock("S")), 0)
+
+    def test_compact_does_not_tick_the_clock_or_change_values(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.insert(1, "b")
+        session.delete(1)
+        before_clock = session.snapshot()["clock"]
+        self.assertEqual(session.compact(frontier(session)), 1)
+        self.assertEqual(session.snapshot()["clock"], before_clock)
+        self.assertEqual(session.values(), ["a"])
+
+    def test_repeated_compact_with_same_frontier_returns_zero(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.insert(1, "b")
+        session.delete(1)
+        stable = frontier(session)
+        self.assertEqual(session.compact(stable), 1)
+        self.assertEqual(session.compact(stable), 0)
+        self.assertEqual(session.compact(stable), 0)
+
+    def test_legacy_tombstones_are_never_compaction_eligible(self) -> None:
+        legacy = {
+            "replica_id": "A",
+            "rga": {
+                "replica_id": "A",
+                "counter": 2,
+                "nodes": [
+                    {"id": [1, "A"], "value": "a", "prev": None},
+                    {"id": [2, "A"], "value": "b", "prev": [1, "A"]},
+                ],
+                "tombstones": [[2, "A"]],
+            },
+            "clock": {"replica_id": "A", "clock": {"A": 2}},
+        }
+        session = RGASession.from_snapshot(legacy)
+        self.assertEqual(session.values(), ["a"])
+        # The clock knows the delete happened, but its time is not inferred:
+        # even the exact observed frontier cannot retire the untagged node.
+        self.assertEqual(session.compact(frontier(session)), 0)
+        self.assertNotIn("compaction", session.snapshot())
+        # And it still blocks the leaf-peeling rule by remaining a record.
+        self.assertIn((2, "A"), session._rga._nodes)
+
+
+class CompactReclamationTests(unittest.TestCase):
+    def _three(self) -> RGASession:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.insert(1, "b")
+        session.insert(2, "c")
+        return session
+
+    def test_leaf_tombstone_is_reclaimed_and_reported(self) -> None:
+        session = self._three()
+        session.delete(2)
+        self.assertEqual(session.compact(frontier(session)), 1)
+        self.assertEqual(session.values(), ["a", "b"])
+        self.assertTrue(is_skeleton(session, (3, "A")))
+
+    def test_continuous_deleted_branch_peels_from_the_leaf(self) -> None:
+        session = self._three()
+        session.delete(2)
+        session.compact(frontier(session))
+        session.delete(1)
+        self.assertEqual(session.compact(frontier(session)), 1)
+        self.assertTrue(is_skeleton(session, (2, "A")))
+        self.assertTrue(is_skeleton(session, (3, "A")))
+        # The surviving head stays a full, visible record.
+        self.assertEqual(session._rga._nodes[(1, "A")][0], "a")
+        self.assertEqual(session.values(), ["a"])
+
+    def test_chain_deleted_together_peels_in_one_call(self) -> None:
+        session = self._three()
+        session.delete(2)
+        session.delete(1)
+        self.assertEqual(session.compact(frontier(session)), 2)
+        self.assertEqual(session.values(), ["a"])
+
+    def test_live_node_blocks_peeling_through_it(self) -> None:
+        session = self._three()
+        # Delete the tail, then delete the head: the live middle keeps the
+        # dead head as its predecessor and the tail peel stops at the middle.
+        session.delete(2)
+        session.delete(0)
+        self.assertEqual(session.compact(frontier(session)), 1)
+        # (1,A) is still a full tombstone record: referenced by live (2,A).
+        self.assertNotIn((1, "A"), session._retired_ids)
+        self.assertEqual(session.values(), ["b"])
+        # Deleting the middle frees the whole branch in a later compaction.
+        session.delete(0)
+        self.assertEqual(session.compact(frontier(session)), 2)
+        self.assertEqual(session.values(), [])
+
+    def test_unstable_delete_is_not_crossed(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.insert(1, "b")
+        session.delete(1)  # b deleted at A:2
+        stable = frontier(session)
+        session.insert(0, "z")
+        session.delete(1)  # a deleted later at A:4, beyond the old frontier
+        # The tail b was deleted first and is a leaf: only it is stable.
+        self.assertEqual(session.compact(stable), 1)
+        self.assertTrue(is_skeleton(session, (2, "A")))
+        self.assertIn((1, "A"), session._rga._nodes)
+        self.assertEqual(session.values(), ["z"])
+        # Same stale frontier cannot make progress.
+        self.assertEqual(session.compact(stable), 0)
+        # A fresh frontier reclaims the rest.
+        self.assertEqual(session.compact(frontier(session)), 1)
+
+    def test_retired_skeleton_keeps_late_branch_in_position(self) -> None:
+        base = RGASession("A")
+        base.insert(0, "a")
+        base.insert(1, "b")
+        base.insert(2, "c")
+        base.insert(3, "d")
+        peer = RGASession("E")
+        peer.merge(base)
+
+        compactor = RGASession("A")
+        compactor.insert(0, "a")
+        compactor.insert(1, "b")
+        compactor.insert(2, "c")
+        compactor.insert(3, "d")
+        compactor.delete(3)
+        compactor.delete(2)
+        self.assertEqual(compactor.compact(frontier(compactor)), 2)
+
+        # The peer still holds full c/d records; merge demotes them but keeps
+        # the visible sequence identical.
+        peer.merge(compactor)
+        self.assertEqual(peer.values(), ["a", "b"])
+        self.assertTrue(is_skeleton(peer, (3, "A")))
+        self.assertTrue(is_skeleton(peer, (4, "A")))
+        self.assertFalse(is_skeleton(peer, (2, "A")))
+        self.assertEqual(restore(peer.snapshot()).values(), ["a", "b"])
+
+
+class CompactSnapshotTests(unittest.TestCase):
+    def test_uncompacted_snapshot_keeps_the_three_field_shape(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.delete(0)
+        snapshot = session.snapshot()
+        self.assertEqual(set(snapshot), {"replica_id", "rga", "clock"})
+        # The tagged tombstone rides inside the legacy-shaped RGA snapshot.
+        self.assertEqual(
+            snapshot["rga"]["tombstones"], [[[1, "A"], [["A", 2]]]]
+        )
+
+    def test_full_round_trip_is_deep_independent_and_json_safe(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.insert(1, "b")
+        session.delete(1)
+        session.compact(frontier(session))
+        first = session.snapshot()
+        second = session.snapshot()
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["rga"], second["rga"])
+        self.assertIsNot(first["compaction"], second["compaction"])
+        self.assertEqual(json.loads(json.dumps(first)), first)
+
+        restored = restore(first)
+        self.assertEqual(restored.snapshot(), first)
+        self.assertEqual(restored.values(), session.values())
+
+        # Mutating the snapshot must not touch the session.
+        first["compaction"]["retired"].append("intruder")
+        first["rga"]["nodes"][0]["value"] = "z"
+        self.assertEqual(session.snapshot(), second)
+
+    def test_compaction_summary_is_deterministic(self) -> None:
+        def make() -> RGASession:
+            session = RGASession("A")
+            session.insert(0, "a")
+            session.insert(1, "b")
+            session.delete(1)
+            session.compact(frontier(session))
+            return session
+        self.assertEqual(make().snapshot(), make().snapshot())
+
+    def test_legacy_four_field_rga_snapshot_still_restores(self) -> None:
+        legacy = {
+            "replica_id": "A",
+            "rga": {
+                "replica_id": "A",
+                "counter": 1,
+                "nodes": [{"id": [1, "A"], "value": "a", "prev": None}],
+                "tombstones": [],
+            },
+            "clock": {"replica_id": "A", "clock": {"A": 1}},
+        }
+        session = restore(legacy)
+        self.assertEqual(session.values(), ["a"])
+        self.assertEqual(set(session.snapshot()), {"replica_id", "rga", "clock"})
+        # Continued editing follows the restored counter and clock.
+        session.insert(1, "b")
+        self.assertEqual(
+            session.snapshot()["clock"]["clock"], {"A": 2}
+        )
+
+    def test_restored_compacted_session_edits_without_id_reuse(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.insert(1, "b")
+        session.delete(1)
+        session.compact(frontier(session))
+        restored = restore(session.snapshot())
+        restored.insert(1, "c")
+        ids = [tuple(node["id"]) for node in restored.snapshot()["rga"]["nodes"]]
+        self.assertEqual(ids, [(1, "A"), (3, "A")])
+        self.assertEqual(restored.values(), ["a", "c"])
+
+    def test_deletion_dot_not_covered_by_clock_is_rejected(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.delete(0)
+        good = wire(session.snapshot())
+        good["rga"]["tombstones"] = [[[1, "A"], [["A", 9]]]]
+        self.assertRaises(ValueError, RGASession.from_snapshot, good)
+
+    def test_malformed_compaction_summaries_are_rejected(self) -> None:
+        session = RGASession("A")
+        session.insert(0, "a")
+        session.delete(0)
+        session.compact(frontier(session))
+        good = wire(session.snapshot())
+
+        def corrupt(mutate) -> object:
+            bad = copy.deepcopy(good)
+            mutate(bad)
+            return bad
+
+        candidates = [
+            lambda b: b["compaction"].pop("retired"),
+            lambda b: b["compaction"].pop("retired_dots"),
+            lambda b: b["compaction"].pop("retired_clock"),
+            lambda b: b["compaction"].update(extra=1),
+            lambda b: b["compaction"].__setitem__("retired", []),
+            lambda b: b["compaction"].__setitem__("retired_dots", []),
+            lambda b: b["compaction"].__setitem__("retired_clock", {}),
+            lambda b: b["compaction"]["retired"][0].pop("value"),
+            lambda b: b["compaction"]["retired"][0].__setitem__("prev", [9, "Z"]),
+            lambda b: b["compaction"]["retired_dots"].append(["A", 9]),
+            lambda b: b["compaction"]["retired_clock"].__setitem__("A", 9),
+        ]
+        for mutate in candidates:
+            with self.subTest():
+                self.assertRaises(
+                    ValueError, RGASession.from_snapshot, corrupt(mutate)
+                )
+
+
+class CompactMergeTests(unittest.TestCase):
+    def _story(self):
+        compacted = RGASession("A")
+        compacted.insert(0, "a")
+        compacted.insert(1, "b")
+        compacted.insert(2, "c")
+        compacted.delete(2)
+        compacted.delete(1)
+        compacted.compact(frontier(compacted))
+        uncompacted = RGASession("A")
+        uncompacted.insert(0, "a")
+        uncompacted.insert(1, "b")
+        uncompacted.insert(2, "c")
+        uncompacted.delete(2)
+        uncompacted.delete(1)
+        return compacted, uncompacted
+
+    def test_compacted_and_uncompacted_converge_both_directions(self) -> None:
+        for receiver_first, sender_second in (
+            (self._story()[0], self._story()[1]),
+            (self._story()[1], self._story()[0]),
+        ):
+            receiver = RGASession("R")
+            receiver.merge(restore(receiver_first.snapshot()))
+            receiver.merge(restore(sender_second.snapshot()))
+            self.assertEqual(receiver.values(), ["a"])
+            self.assertTrue(is_skeleton(receiver, (2, "A")))
+            self.assertTrue(is_skeleton(receiver, (3, "A")))
+
+    def test_stale_duplicate_and_out_of_order_packets_never_resurrect(self) -> None:
+        compacted, uncompacted = self._story()
+        old_packet = wire(uncompacted.snapshot())
+        new_packet = wire(compacted.snapshot())
+
+        receiver = RGASession("R")
+        for packet in (new_packet, old_packet, new_packet, old_packet,
+                       old_packet):
+            receiver.merge(restore(packet))
+        self.assertEqual(receiver.values(), ["a"])
+        self.assertTrue(is_skeleton(receiver, (2, "A")))
+        self.assertTrue(is_skeleton(receiver, (3, "A")))
+        # A retired node never reappears as a full value record.
+        for node_id in ((2, "A"), (3, "A")):
+            self.assertTrue(is_skeleton(receiver, node_id))
+
+    def test_compaction_spreads_through_merge(self) -> None:
+        compacted, uncompacted = self._story()
+        # Uncompacted first receives a live state, then the compacted packet;
+        # it adopts the retirement and its output shrinks to match.
+        uncompacted.merge(restore(compacted.snapshot()))
+        self.assertEqual(
+            shared_view(uncompacted)["compaction"],
+            shared_view(compacted)["compaction"],
+        )
+        self.assertEqual(uncompacted.values(), ["a"])
+
+    def test_converged_sessions_agree_on_shared_snapshot(self) -> None:
+        compacted, uncompacted = self._story()
+        left = RGASession("L")
+        right = RGASession("M")
+        left.merge(restore(compacted.snapshot()))
+        right.merge(restore(uncompacted.snapshot()))
+        left.merge(restore(uncompacted.snapshot()))
+        right.merge(restore(compacted.snapshot()))
+        self.assertEqual(left.values(), right.values())
+        self.assertEqual(shared_view(left), shared_view(right))
+        self.assertNotEqual(left.replica_id, right.replica_id)
+
+    def test_same_id_conflicting_content_still_raises_after_compaction(self) -> None:
+        # Two replicas sharing an id minted colliding records with different
+        # content; one side then compacts the loser. The conflict must still
+        # surface, atomically.
+        first = RGASession("A")
+        first.insert(0, "x")
+        second = RGASession("A")
+        second.insert(0, "y")
+
+        compacted = RGASession("C")
+        compacted.merge(first)
+        compacted.delete(0)
+        self.assertEqual(compacted.compact(frontier(compacted)), 1)
+
+        before = wire(compacted.snapshot())
+        self.assertRaises(ValueError, compacted.merge, second)
+        self.assertEqual(compacted.snapshot(),
+                         RGASession.from_snapshot(before).snapshot())
+        self.assertEqual(compacted.values(), [])
+
+    def test_conflicting_retired_predecessor_raises_atomically(self) -> None:
+        first = RGASession("A")
+        first.insert(0, "x")
+        first.insert(1, "y")
+        holder = RGASession("H")
+        holder.merge(first)
+
+        compacted = RGASession("H")
+        compacted.merge(first)
+        compacted.delete(1)  # retire the tail y
+        compacted.compact(frontier(compacted))
+
+        # Forge a second compacted state claiming the retired id hung off a
+        # different predecessor (root instead of x).
+        forged = restore(compacted.snapshot())
+        forged._retired_prev[(2, "A")] = None
+        forged._rga._nodes[(2, "A")] = (_RETIRED, None)
+        before = wire(holder.snapshot())
+        self.assertRaises(ValueError, holder.merge, forged)
+        self.assertEqual(holder.snapshot(),
+                         RGASession.from_snapshot(before).snapshot())
+
+    def test_merge_relation_still_comes_from_pre_merge_clocks(self) -> None:
+        left = RGASession("A")
+        left.insert(0, "a")
+        left.delete(0)
+        left.compact(frontier(left))
+
+        right = RGASession("B")
+        self.assertEqual(right.merge(restore(left.snapshot())), "after")
+        right.insert(0, "b")
+        self.assertEqual(right.merge(restore(left.snapshot())), "before")
+        left.insert(0, "a2")
+        self.assertEqual(right.merge(restore(left.snapshot())), "concurrent")
+
+    def test_offline_compaction_converges_under_messy_delivery(self) -> None:
+        a, b, c = RGASession("A"), RGASession("B"), RGASession("C")
+        a.insert(0, "a")
+        common = wire(a.snapshot())
+        for peer in (b, c):
+            peer.merge(restore(common))
+
+        b.delete(0)
+        c.insert(1, "c")
+        a.insert(1, "a2")
+        b.insert(0, "b")
+        c.delete(0)
+
+        packets = [
+            wire(c.snapshot()), wire(common), wire(b.snapshot()),
+            wire(a.snapshot()), wire(c.snapshot()), wire(b.snapshot()),
+        ]
+        for packet in packets:
+            for receiver in (a, b, c):
+                receiver.merge(restore(packet))
+
+        # Fully converged: ["b", "c", "a2"]. Now A deletes the leaf a2 once
+        # everyone could have observed it, and compacts against the shared
+        # frontier.
+        a.delete(2)
+        stable = frontier(a)
+        self.assertEqual(a.compact(stable), 1)
+
+        # Re-exchange everything — including stale pre-compaction packets
+        # and the new compacted one, with duplicates — in arbitrary order.
+        packets = [
+            wire(a.snapshot()), wire(c.snapshot()), wire(common),
+            wire(b.snapshot()), wire(a.snapshot()), wire(c.snapshot()),
+        ]
+        for packet in packets:
+            for receiver in (a, b, c):
+                receiver.merge(restore(packet))
+
+        for receiver in (a, b, c):
+            self.assertEqual(receiver.values(), ["b", "c"])
+        self.assertEqual(shared_view(a), shared_view(b))
+        self.assertEqual(shared_view(b), shared_view(c))
+        # The retired leaf never returns as a full record anywhere.
+        for receiver in (a, b, c):
+            self.assertTrue(is_skeleton(receiver, (2, "A")))
 
 
 if __name__ == "__main__":
